@@ -1,0 +1,58 @@
+# ─── Python ───────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg
+*.egg-info/
+dist/
+build/
+.eggs/
+.Python
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+.env
+
+# ─── macOS ────────────────────────────────────────────────
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+*.icloud
+
+# ─── IDEs ─────────────────────────────────────────────────
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.project
+.classpath
+
+# ─── Logs & Temp ──────────────────────────────────────────
+*.log
+*.tmp
+*.temp
+*.bak
+*.orig
+*.pid
+
+# ─── Test & Coverage ──────────────────────────────────────
+.coverage
+.tox/
+.pytest_cache/
+htmlcov/
+coverage.xml
+*.cover
+
+# ─── Distribution ─────────────────────────────────────────
+*.dmg
+*.pkg
+*.spec
