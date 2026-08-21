@@ -196,6 +196,7 @@ def launch_avd(avd_name: str) -> bool:
                 if r.stdout.strip() == "1":
                     print()
                     print(f"  ✓ Emulator ready: {new_serial}")
+                    wait_for_boot_and_tune(new_serial, timeout=30)
                     return True
             except Exception:
                 pass
@@ -230,7 +231,212 @@ def cleanup_dead_sessions():
         del active_sessions[s]
 
 
+# ---------------------------------------------------------------------------
+# AVD creation helpers
+# ---------------------------------------------------------------------------
+
+# Device profiles: (display_label, avd_manager_id, recommended_ram_mb)
+DEVICE_PROFILES = [
+    ("Medium Phone  (1080×2400, 420 dpi) — recommended",  "medium_phone",   3072),
+    ("Pixel 8       (1080×2400, 420 dpi)",                 "pixel_8",        3072),
+    ("Pixel 8 Pro   (1344×2992, 560 dpi) — high-end",     "pixel_8_pro",    4096),
+    ("Small Phone   (720×1280, 320 dpi)  — lightweight",   "2.7in QVGA",     1536),
+    ("Pixel Tablet  (2560×1600, 320 dpi) — tablet layout", "pixel_tablet",   4096),
+]
+
+def detect_host_abi() -> str:
+    """
+    Detect the best ABI for emulator images based on host CPU.
+    Apple Silicon → arm64-v8a  |  Intel/AMD → x86_64
+    """
+    try:
+        r = subprocess.run(["uname", "-m"], capture_output=True, text=True)
+        machine = r.stdout.strip().lower()
+        if machine in ("arm64", "aarch64"):
+            return "arm64-v8a"
+    except Exception:
+        pass
+    return "x86_64"
+
+
+def get_android_home() -> str | None:
+    """Return ANDROID_HOME / ANDROID_SDK_ROOT path, or auto-detect common locations."""
+    path = os.environ.get("ANDROID_HOME") or os.environ.get("ANDROID_SDK_ROOT")
+    if path and os.path.isdir(path):
+        return path
+    # Common macOS location
+    candidates = [
+        os.path.expanduser("~/Library/Android/sdk"),
+        os.path.expanduser("~/Android/Sdk"),           # Linux default
+        "/usr/local/lib/android/sdk",                  # CI / GitHub Actions
+    ]
+    for c in candidates:
+        if os.path.isdir(c):
+            return c
+    return None
+
+
+def scan_system_images(android_home: str, preferred_abi: str) -> list[dict]:
+    """
+    Scan $ANDROID_HOME/system-images/ and return a list of available image dicts:
+      { path, api, tag, abi, label, recommended }
+    Sorted: preferred ABI first, then by API level descending.
+    """
+    images_dir = os.path.join(android_home, "system-images")
+    if not os.path.isdir(images_dir):
+        return []
+
+    images = []
+    for android_ver in os.listdir(images_dir):          # e.g. android-34
+        ver_path = os.path.join(images_dir, android_ver)
+        if not os.path.isdir(ver_path):
+            continue
+        for tag in os.listdir(ver_path):                # e.g. google_apis
+            tag_path = os.path.join(ver_path, tag)
+            if not os.path.isdir(tag_path):
+                continue
+            for abi in os.listdir(tag_path):            # e.g. arm64-v8a
+                abi_path = os.path.join(tag_path, abi)
+                if not os.path.isdir(abi_path):
+                    continue
+                # Validate it's a real system image
+                if not os.path.isfile(os.path.join(abi_path, "system.img")):
+                    continue
+
+                api_num = int(android_ver.replace("android-", "")) if android_ver.replace("android-", "").isdigit() else 0
+                recommended = (abi == preferred_abi and tag == "google_apis" and api_num >= 33)
+
+                # Human-readable tag label
+                tag_label = {
+                    "google_apis":            "Google APIs",
+                    "google_apis_playstore":  "Google Play Store",
+                    "default":                "AOSP (no Google)",
+                }.get(tag, tag)
+
+                label = f"API {api_num}  |  {tag_label:<22}  |  {abi}"
+                if recommended:
+                    label += "  ← recommended"
+
+                images.append({
+                    "path":        f"{android_ver};{tag};{abi}",
+                    "api":         api_num,
+                    "tag":         tag,
+                    "abi":         abi,
+                    "label":       label,
+                    "recommended": recommended,
+                })
+
+    # Sort: recommended first, then by API desc, preferred ABI first
+    images.sort(key=lambda x: (
+        not x["recommended"],
+        -x["api"],
+        x["abi"] != preferred_abi,
+    ))
+    return images
+
+
+def disable_animations(serial: str):
+    """Disable all animation scales on a device/emulator via ADB."""
+    for key in ["window_animation_scale", "transition_animation_scale", "animator_duration_scale"]:
+        subprocess.run(
+            ["adb", "-s", serial, "shell", "settings", "put", "global", key, "0"],
+            capture_output=True
+        )
+
+
+def wait_for_boot_and_tune(serial: str, timeout: int = 120):
+    """
+    Wait until boot_completed == 1, then auto-disable animations.
+    Shows a progress indicator while waiting.
+    """
+    print("    Waiting for full boot", end="", flush=True)
+    start = time.time()
+    while time.time() - start < timeout:
+        time.sleep(3)
+        print(".", end="", flush=True)
+        try:
+            r = subprocess.run(
+                ["adb", "-s", serial, "shell", "getprop", "sys.boot_completed"],
+                capture_output=True, text=True, timeout=3
+            )
+            if r.stdout.strip() == "1":
+                print(" done!")
+                print("  → Disabling animations for faster testing...")
+                disable_animations(serial)
+                print("  ✓ Animations disabled. Emulator is ready.")
+                return True
+        except Exception:
+            pass
+    print()
+    print(f"  ⚠  Boot timeout ({timeout}s). You can disable animations manually:")
+    print("     adb shell settings put global window_animation_scale 0")
+    print("     adb shell settings put global transition_animation_scale 0")
+    print("     adb shell settings put global animator_duration_scale 0")
+    return False
+
+
+def prompt_avd_config(defaults: dict) -> dict | None:
+    """
+    Show current defaults, let user override each field or accept all.
+    Returns final config dict, or None if user cancels.
+    """
+    print()
+    print("  Current configuration (press Enter to keep default):")
+    print(f"  ┌{'─'*44}┐")
+    print(f"  │  RAM        : {defaults['ram_mb']} MB{'':<20}│")
+    print(f"  │  CPU cores  : {defaults['cpu_cores']}{'':<28}│")
+    print(f"  │  Storage    : {defaults['storage_mb']} MB{'':<18}│")
+    print(f"  │  Graphics   : {defaults['graphics']}{'':<25}│")
+    print(f"  └{'─'*44}┘")
+    print()
+
+    cfg = dict(defaults)
+
+    # RAM
+    try:
+        raw = input(f"  RAM in MB [{defaults['ram_mb']}] (0=back): ").strip()
+    except (EOFError, KeyboardInterrupt):
+        return None
+    if raw in ("0", "b", "back"):
+        return None
+    if raw and raw.isdigit():
+        cfg["ram_mb"] = int(raw)
+
+    # CPU cores
+    try:
+        raw = input(f"  CPU cores [{defaults['cpu_cores']}] (0=back): ").strip()
+    except (EOFError, KeyboardInterrupt):
+        return None
+    if raw in ("0", "b", "back"):
+        return None
+    if raw and raw.isdigit():
+        cfg["cpu_cores"] = int(raw)
+
+    # Storage
+    try:
+        raw = input(f"  Internal storage MB [{defaults['storage_mb']}] (0=back): ").strip()
+    except (EOFError, KeyboardInterrupt):
+        return None
+    if raw in ("0", "b", "back"):
+        return None
+    if raw and raw.isdigit():
+        cfg["storage_mb"] = int(raw)
+
+    # Graphics
+    try:
+        raw = input(f"  Graphics [hardware/software/auto] [{defaults['graphics']}] (0=back): ").strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        return None
+    if raw in ("0", "b", "back"):
+        return None
+    if raw in ("hardware", "software", "auto"):
+        cfg["graphics"] = raw
+
+    return cfg
+
+
 def print_header():
+
     print()
     print("=" * 50)
     print("             scrcpy Launcher")
@@ -400,6 +606,251 @@ def action_launch():
             do_launch_scrcpy(s)
 
     print("\n  scrcpy is running. Close the scrcpy window to end the session.")
+
+
+def action_new_avd():
+    """
+    Wizard to create a new AVD.
+
+    Jalur A — No system images found:
+      Show install instructions (sdkmanager CLI + Android Studio SDK Manager).
+
+    Jalur B — System images available:
+      1. Pick system image
+      2. Pick device profile
+      3. Enter AVD name
+      4. Review + customize hardware config (smart defaults)
+      5. Run avdmanager create avd
+      6. Offer to launch immediately → if launched, auto-disable animations after boot
+    """
+    print("\n  ── Create New AVD ────────────────────────────────────")
+
+    # ── Prerequisite checks ──────────────────────────────────────────────────
+    if not check_command("avdmanager"):
+        print()
+        print("  ✗ 'avdmanager' not found.")
+        print("    Make sure Android Studio is installed and ANDROID_HOME is set:")
+        print()
+        print("    macOS  : export ANDROID_HOME=~/Library/Android/sdk")
+        print("    Linux  : export ANDROID_HOME=~/Android/Sdk")
+        print("    Windows: set ANDROID_HOME=%LOCALAPPDATA%\\Android\\Sdk")
+        print()
+        print("    Then add $ANDROID_HOME/cmdline-tools/latest/bin to your PATH.")
+        return
+
+    android_home = get_android_home()
+    if not android_home:
+        print()
+        print("  ✗ ANDROID_HOME not found. Set it and try again:")
+        print("    macOS/Linux : export ANDROID_HOME=~/Library/Android/sdk")
+        print("    Windows     : set ANDROID_HOME=%LOCALAPPDATA%\\Android\\Sdk")
+        return
+
+    preferred_abi = detect_host_abi()
+    print(f"\n  Host ABI detected: {preferred_abi}")
+
+    # ── Scan system images ───────────────────────────────────────────────────
+    print("  Scanning system images...", end="", flush=True)
+    images = scan_system_images(android_home, preferred_abi)
+    print(f" found {len(images)}.")
+
+    # ── JALUR A: No system images → show install wizard ──────────────────────
+    if not images:
+        print()
+        print("  ✗ No system images found in:")
+        print(f"    {android_home}/system-images/")
+        print()
+        print("  ── Install System Image ──────────────────────────────")
+        print()
+        print("  Option 1 — Android Studio (recommended):")
+        print("    Tools → SDK Manager → SDK Platforms")
+        print("    Check the API level you want → Apply")
+        print()
+        print("  Option 2 — Command line (sdkmanager):")
+        print()
+
+        # Show recommended image based on detected ABI
+        rec_image = f"\"system-images;android-34;google_apis;{preferred_abi}\""
+        print(f"    # Install recommended (API 34, Google APIs, {preferred_abi}):")
+        print(f"    sdkmanager {rec_image}")
+        print()
+        print("    # Or list all available images:")
+        print("    sdkmanager --list | grep system-images")
+        print()
+        print("  Option 3 — Common images to install:")
+        for api, tag in [("34", "google_apis"), ("33", "google_apis"), ("30", "google_apis")]:
+            print(f"    sdkmanager \"system-images;android-{api};{tag};{preferred_abi}\"")
+        print()
+        print("  After installing, come back and press N again to create the AVD.")
+        return
+
+    # ── JALUR B: System images available → creation wizard ───────────────────
+
+    # Step 1: Pick system image
+    print()
+    print("  Step 1 of 4 — Select system image")
+    print("  (Use Google APIs for daily dev — fastest, no Play Store overhead)")
+    print()
+
+    img_labels = [img["label"] for img in images]
+    selected_imgs = select_from_list(images, img_labels, "system image")
+    if not selected_imgs:
+        return
+    chosen_image = selected_imgs[0]  # single select
+    print(f"  ✓ Image: {chosen_image['label'].split('←')[0].strip()}")
+
+    # Step 2: Pick device profile
+    print()
+    print("  Step 2 of 4 — Select device profile")
+    print()
+
+    dev_labels = [p[0] for p in DEVICE_PROFILES]
+    selected_devs = select_from_list(DEVICE_PROFILES, dev_labels, "device profile")
+    if not selected_devs:
+        return
+    chosen_dev = selected_devs[0]
+    dev_display, dev_id, rec_ram = chosen_dev
+    print(f"  ✓ Device: {dev_display.split('—')[0].strip()}")
+
+    # Step 3: AVD name
+    print()
+    print("  Step 3 of 4 — AVD name")
+    print("  (Letters, numbers, underscores and dashes only. No spaces.)")
+    print()
+
+    while True:
+        try:
+            avd_name = input("  AVD name (0=back): ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print("\n  Cancelled.")
+            return
+        if not avd_name or avd_name in ("0", "b", "back"):
+            print("  Going back to menu.")
+            return
+        if not re.match(r'^[\w\-]+$', avd_name):
+            print("  Invalid name. Use letters, numbers, _ or - only.\n")
+            continue
+        # Check duplicate
+        existing = get_avd_list()
+        if avd_name in existing:
+            print(f"  AVD '{avd_name}' already exists. Choose a different name.\n")
+            continue
+        break
+
+    print(f"  ✓ Name: {avd_name}")
+
+    # Step 4: Hardware config with smart defaults
+    print()
+    print("  Step 4 of 4 — Hardware configuration")
+
+    defaults = {
+        "ram_mb":     rec_ram,
+        "cpu_cores":  4,
+        "storage_mb": 6144,
+        "graphics":   "hardware",
+    }
+    config = prompt_avd_config(defaults)
+    if config is None:
+        print("  Going back to menu.")
+        return
+
+    # ── Summary before create ────────────────────────────────────────────────
+    print()
+    print("  ── Summary ───────────────────────────────────────────")
+    print(f"  Name    : {avd_name}")
+    print(f"  Image   : {chosen_image['path']}")
+    print(f"  Device  : {dev_display.split('—')[0].strip()}")
+    print(f"  RAM     : {config['ram_mb']} MB")
+    print(f"  CPU     : {config['cpu_cores']} cores")
+    print(f"  Storage : {config['storage_mb']} MB")
+    print(f"  Graphics: {config['graphics']}")
+    print()
+
+    try:
+        confirm = input("  Create AVD? [Y/n]: ").strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        print("\n  Cancelled.")
+        return
+    if confirm == "n":
+        print("  Cancelled.")
+        return
+
+    # ── Run avdmanager create avd ────────────────────────────────────────────
+    print()
+    print(f"  → Creating AVD '{avd_name}'...")
+
+    cmd = [
+        "avdmanager", "create", "avd",
+        "--name",   avd_name,
+        "--package", chosen_image["path"],
+        "--device",  dev_id,
+        "--force",
+    ]
+
+    try:
+        # avdmanager sometimes asks "Do you wish to create a custom hardware profile? [no]"
+        # pipe "no\n" to stdin to auto-answer
+        proc = subprocess.run(
+            cmd,
+            input="no\n",
+            capture_output=True,
+            text=True,
+            timeout=60
+        )
+        if proc.returncode != 0:
+            print(f"  ✗ avdmanager error:\n{proc.stderr.strip()}")
+            return
+    except subprocess.TimeoutExpired:
+        print("  ✗ Timeout creating AVD.")
+        return
+    except Exception as e:
+        print(f"  ✗ Error: {e}")
+        return
+
+    # ── Write hardware config overrides to AVD ini ────────────────────────────
+    avd_dir = os.path.expanduser(f"~/.android/avd/{avd_name}.avd")
+    config_file = os.path.join(avd_dir, "config.ini")
+    if os.path.isfile(config_file):
+        # Read existing config
+        with open(config_file, "r") as f:
+            lines = f.readlines()
+
+        overrides = {
+            "hw.ramSize":           str(config["ram_mb"]),
+            "hw.cpu.ncore":         str(config["cpu_cores"]),
+            "disk.dataPartition.size": f"{config['storage_mb']}M",
+            "hw.gpu.enabled":       "yes" if config["graphics"] != "software" else "no",
+            "hw.gpu.mode":          config["graphics"],
+            "fastboot.chosenSnapshotFile": "",
+            "fastboot.forceChosenSnapshotBoot": "no",
+            "fastboot.forceColdBoot": "no",
+            "fastboot.forceFastBoot": "yes",
+        }
+
+        # Update existing keys or append new ones
+        existing_keys = {}
+        new_lines = []
+        for line in lines:
+            if "=" in line:
+                key = line.split("=")[0].strip()
+                if key in overrides:
+                    new_lines.append(f"{key} = {overrides[key]}\n")
+                    existing_keys[key] = True
+                    continue
+            new_lines.append(line)
+
+        # Append keys that didn't exist yet
+        for key, val in overrides.items():
+            if key not in existing_keys:
+                new_lines.append(f"{key} = {val}\n")
+
+        with open(config_file, "w") as f:
+            f.writelines(new_lines)
+
+    print(f"  ✓ AVD '{avd_name}' created successfully!")
+    print()
+    print("  Going back to menu. Press L to launch the new AVD.")
+    print("  Animations will be disabled automatically after first boot.")
 
 
 def action_kill(serials: list[str]):
@@ -629,12 +1080,13 @@ def main():
         print("  R - Reconnect (kill + relaunch active session)")
         print("  K - Kill / stop active session")
         print("  P - Pair new device via Wi-Fi ADB")
+        print("  N - New AVD (create Android emulator)")
         print("  F - Refresh device list")
         print("  Q - Quit")
         print()
 
         try:
-            choice = input("  Choose action [L/R/K/P/F/Q]: ").strip().upper()
+            choice = input("  Choose action [L/R/K/P/N/F/Q]: ").strip().upper()
         except (EOFError, KeyboardInterrupt):
             choice = "Q"
 
@@ -646,6 +1098,8 @@ def main():
             action_kill_menu()
         elif choice == "P":
             action_pair()
+        elif choice == "N":
+            action_new_avd()
         elif choice == "F":
             print("\n  Refreshing...")
             continue  # loop immediately → print_header + print_status re-runs
@@ -662,9 +1116,9 @@ def main():
             print("\n  Goodbye!\n")
             break
         else:
-            print("\n  Invalid choice. Enter L, R, K, P, F, or Q.")
+            print("\n  Invalid choice. Enter L, R, K, P, N, F, or Q.")
 
-        if choice != "F":
+        if choice not in ("F",):
             input("\n  Press Enter to return to menu...")
 
 

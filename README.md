@@ -170,15 +170,18 @@ python3 scrcpy_launcher.py
 ==================================================
 
   No active sessions.
+  No idle devices.
 
   Actions:
   L - Launch scrcpy
   R - Reconnect (kill + relaunch active session)
   K - Kill / stop active session
   P - Pair new device via Wi-Fi ADB
+  N - New AVD (create Android emulator)
+  F - Refresh device list
   Q - Quit
 
-  Choose action [L/R/K/P/Q]: _
+  Choose action [L/R/K/P/N/F/Q]: _
 ```
 
 ### Wi-Fi ADB Pairing Flow (menu P)
@@ -235,7 +238,52 @@ python3 scrcpy_launcher.py
 > - **Pairing port** → shown in the "Pair device with pairing code" dialog (random 5-digit, changes every session)
 > - **Connect port** → larger port number on the main Wireless Debugging screen (persists while Wireless Debugging is on)
 
-### Launch Flow (menu L)
+### New AVD Flow (menu N)
+
+**Path A — No system images installed:**
+```
+  ✗ No system images found.
+
+  ── Install System Image ──────────────────────────────
+  Option 1 — Android Studio (recommended):
+    Tools → SDK Manager → SDK Platforms → check API level → Apply
+
+  Option 2 — Command line:
+    sdkmanager "system-images;android-34;google_apis;arm64-v8a"
+
+  After installing, press N again to create the AVD.
+```
+
+**Path B — System images available (4-step wizard):**
+```
+  Step 1 of 4 — Select system image
+  1. API 34  |  Google APIs          |  arm64-v8a  ← recommended
+  2. API 34  |  Google Play Store    |  arm64-v8a
+  3. API 33  |  Google APIs          |  arm64-v8a
+
+  Step 2 of 4 — Select device profile
+  1. Medium Phone  (1080×2400, 420 dpi) — recommended
+  2. Pixel 8       (1080×2400, 420 dpi)
+  3. Small Phone   (720×1280,  320 dpi) — lightweight
+
+  Step 3 of 4 — AVD name
+  AVD name (0=back): MyPixel8
+
+  Step 4 of 4 — Hardware configuration
+  ┌────────────────────────────────────────────┐
+  │  RAM        : 3072 MB                      │
+  │  CPU cores  : 4                            │
+  │  Storage    : 6144 MB                      │
+  │  Graphics   : hardware                     │
+  └────────────────────────────────────────────┘
+  (press Enter on each to keep default)
+
+  → Creating AVD 'MyPixel8'...
+  ✓ AVD 'MyPixel8' created successfully!
+  Animations will be disabled automatically after first boot.
+```
+
+> Animations are disabled automatically (`window_animation_scale`, `transition_animation_scale`, `animator_duration_scale` all set to 0) every time an emulator boots — no manual steps needed.
 
 ```
 ==================================================
@@ -426,6 +474,20 @@ The Android `emulator` binary is not available for ARM. Use a real Android devic
 ## Contributing
 
 See [docs/CONTRIBUTING.md](docs/CONTRIBUTING.md).
+
+---
+
+## Support This Project
+
+If this tool saved you some time, a coffee would be appreciated ☕
+
+<p align="center">
+  <a href="https://saweria.co/kanzankazu">
+    <img src="https://img.shields.io/badge/Saweria-Donate-orange?logo=ko-fi&logoColor=white" alt="Saweria"/>
+  </a>
+</p>
+
+> [Saweria](https://saweria.co/kanzankazu) — transfer bank lokal, QRIS, PayPal
 
 ---
 
